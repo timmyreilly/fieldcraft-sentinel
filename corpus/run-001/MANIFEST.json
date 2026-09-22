@@ -1,0 +1,35 @@
+{
+  "run_id": "run-001",
+  "files": [
+    {
+      "path": "eval_summary.json",
+      "size_bytes": 2058,
+      "sha256": "b472d72e9018d3fe87c4e5edb76bedd3176d3cd99af5061ba0f2946a37155d71"
+    },
+    {
+      "path": "flow_features.csv",
+      "size_bytes": 2211,
+      "sha256": "ddf573fbf9527cecc2ab04ee86a60f5bec1a7d468cea91f4d40fca7a94ec97f6"
+    },
+    {
+      "path": "pcap/baseline.pcap",
+      "size_bytes": 71712,
+      "sha256": "b5f00508602b8e93d8581c2a48b2d57e8ef192ebc1d0d6e41b2862e1b779fb77"
+    },
+    {
+      "path": "pcap/exfil.pcap",
+      "size_bytes": 6536,
+      "sha256": "d3bff48e060bf21af6504978128c5afb3b67e6b321fb6d89e81ba90d58bd4f08"
+    },
+    {
+      "path": "pcap/port-scan.pcap",
+      "size_bytes": 36424,
+      "sha256": "d483e6d3b590a5e912440a306799287559e684bbf43ef8dd3931b64eb5e52b48"
+    },
+    {
+      "path": "pcap/syn-flood.pcap",
+      "size_bytes": 17932,
+      "sha256": "88af16cca8eb2c060c707ae3f5ea8751b260a8331d750d2d33b982bfec98011a"
+    }
+  ]
+}

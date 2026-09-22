@@ -108,6 +108,127 @@ and the incident will appear in the Triage console
 (`https://fieldcraft-triage-bqfkc5d6aufme9dc.b02.azurefd.net/console`,
 tenant `smoke-tenant`).
 
+## Eval-ops: swapping detectors, corpus capture, and MLflow
+
+Fieldcraft Sentinel is built so new detection algorithms can be developed,
+backtested against real captured traffic, and shipped without touching the
+live pipeline's control flow.
+
+### Detector registry (how algorithms get swapped in)
+
+`detectors.py` exposes `DETECTOR_REGISTRY` (dict of `name -> DetectorClass`),
+each with a `version` and `description`. Every detector implements
+`evaluate_features(src_ip, features, now)` against the shared
+`FEATURE_NAMES` schema (`packet_count`, `byte_count`, `unique_ports`,
+`unique_dst_ips`, `syn_count`, `mean_packet_size`) — `evaluate()` (used on
+live `FlowWindow`s) is just a thin adapter onto that same method. This means
+a corpus of feature rows can replay through any detector without a live
+packet capture.
+
+To ship a new/faster algorithm: implement a `BaseDetector` subclass, bump its
+`version`, register it in `DETECTOR_REGISTRY`, backtest it with
+`eval_harness.py` (below), then select it live with `--algorithm <name>`.
+
+### Capturing a labeled traffic corpus
+
+```bash
+sudo .venv/bin/python corpus_capture.py --interface lo --run-id run-002
+```
+
+This drives `traffic_gen.py`'s scenarios (`baseline`, `port-scan`,
+`syn-flood`, `exfil`) back-to-back, snapshotting flow features on an
+independent 1-second wall-clock timer (decoupled from packet arrival so
+fast scenarios like port-scan/syn-flood still get sampled), and clears flow
+state between scenarios to avoid cross-scenario contamination. Output:
+
+```
+corpus/<run-id>/flow_features.csv   # labeled feature rows (data-scientist corpus)
+corpus/<run-id>/pcap/<scenario>.pcap  # raw packets per scenario, for reprocessing
+```
+
+### Packaging a corpus run to send to data scientists
+
+```bash
+python3 - <<'PY'
+import json, hashlib
+from pathlib import Path
+run_dir = Path("corpus/run-001")
+manifest = {"run_id": run_dir.name, "files": []}
+for p in sorted(run_dir.rglob("*")):
+    if p.is_file() and p.name != "MANIFEST.json":
+        manifest["files"].append({
+            "path": str(p.relative_to(run_dir)),
+            "size_bytes": p.stat().st_size,
+            "sha256": hashlib.sha256(p.read_bytes()).hexdigest(),
+        })
+json.dump(manifest, open(run_dir / "MANIFEST.json", "w"), indent=2)
+PY
+mkdir -p dist
+tar -czf dist/fieldcraft-corpus-run-001.tar.gz -C corpus run-001
+```
+
+Ship `dist/fieldcraft-corpus-run-001.tar.gz` — it contains the labeled CSV,
+per-scenario pcaps, the `eval_summary.json` baseline metrics, and a
+checksummed `MANIFEST.json` for integrity verification. (`corpus/*/pcap/`
+and `dist/` are gitignored — pcaps can be large and are meant to be shipped
+as artifacts, not committed.)
+
+### Offline backtesting (precision/recall/F1 per algorithm)
+
+```bash
+.venv/bin/python eval_harness.py --corpus corpus/run-001/flow_features.csv
+```
+
+Replays every labeled row through each registered detector's
+`evaluate_features()`, treats `baseline` as the negative class and any other
+scenario label as positive/attack, and prints + logs precision/recall/F1/
+accuracy plus per-scenario detection rate. One MLflow run is logged per
+algorithm (params: algorithm/version/description/corpus path+row count;
+metrics: precision/recall/f1/accuracy/confusion-matrix counts). Also writes
+`corpus/run-001/eval_summary.json` next to the corpus.
+
+### Live MLflow logging
+
+`main.py` logs live detection activity to MLflow by default (disable with
+`--no-mlflow`):
+
+```bash
+sudo .venv/bin/python main.py --bearer-token "$TOKEN" --tenant-id smoke-tenant \
+  --algorithm rules --interface lo \
+  --mlflow-experiment fieldcraft-sentinel-live
+```
+
+Logs `incidents_reported` / `severity_<level>_count` per detection and
+`total_incidents_reported` at shutdown, plus detector `algorithm`/`version`
+as params.
+
+### Where MLflow runs land
+
+By default (no `MLFLOW_TRACKING_URI` set), MLflow 3.x uses its own local
+SQLite store at `./mlflow.db` (gitignored) — inspect with:
+
+```bash
+.venv/bin/mlflow ui --backend-store-uri sqlite:///$(pwd)/mlflow.db
+```
+
+To report into the Azure ML workspace's MLflow tracking server instead
+(`mlw-fieldcraft-dev`, subscription `feb19c97-3e24-4bff-a8eb-79400052dc9f`,
+resource group `rg-fieldcraft-dev`):
+
+```bash
+pip install azureml-mlflow
+az login   # needs access to subscription feb19c97-3e24-4bff-a8eb-79400052dc9f
+export MLFLOW_TRACKING_URI="azureml://<region>.api.azureml.ms/mlflow/v1.0/subscriptions/feb19c97-3e24-4bff-a8eb-79400052dc9f/resourceGroups/rg-fieldcraft-dev/providers/Microsoft.MachineLearningServices/workspaces/mlw-fieldcraft-dev"
+# or: az ml workspace show -n mlw-fieldcraft-dev -g rg-fieldcraft-dev --query mlFlowTrackingUri -o tsv
+```
+
+Both `eval_harness.py --tracking-uri <uri>` and `main.py --mlflow-tracking-uri
+<uri>` also accept it directly as a flag.
+
+MLflow's anonymous telemetry is disabled by default in this repo
+(`MLFLOW_DISABLE_TELEMETRY=1` set in `main.py`/`eval_harness.py`) so no usage
+data leaves the machine beyond the tracking store you configure.
+
 ## Notes / known constraints
 
 - `pyshark` predates Python 3.14's asyncio changes; `main.py` includes a small

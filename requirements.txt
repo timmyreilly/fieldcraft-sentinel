@@ -1,2 +1,5 @@
 pyshark
 requests
+mlflow>=3.16
+pandas>=2.0
+scikit-learn>=1.4

@@ -3,6 +3,14 @@
 Each detector consumes rolling per-source-IP flow statistics and returns a
 Detection (or None). The pipeline in main.py turns a Detection into a
 Fieldcraft Triage incident.
+
+Eval-ops note: every detector's core logic lives in `evaluate_features`,
+which operates on a plain feature dict (see `FlowWindow.to_features`). This
+lets `eval_harness.py` replay a labeled corpus of feature rows (no raw
+packets needed) through any registered algorithm to score precision/recall
+before shipping it, and lets `main.py` reuse the identical logic against
+live traffic. `evaluate()` is just a thin adapter from a FlowWindow to a
+features dict.
 """
 from __future__ import annotations
 
@@ -24,6 +32,19 @@ class PacketEvent:
     proto: str
     length: int
     flags: str = ""  # e.g. TCP flags string like "S", "SA", "PA"
+
+
+# Canonical feature schema shared by every detector and by the corpus CSV
+# (see corpus_capture.py / eval_harness.py). Keep this list in sync with
+# FlowWindow.to_features().
+FEATURE_NAMES = (
+    "packet_count",
+    "byte_count",
+    "unique_ports",
+    "unique_dst_ips",
+    "syn_count",
+    "mean_packet_size",
+)
 
 
 @dataclass
@@ -60,6 +81,18 @@ class FlowWindow:
             return 0.0
         return statistics.fmean(p.length for p in self.packets)
 
+    def to_features(self) -> dict[str, float]:
+        """Canonical feature snapshot: the contract every detector and the
+        corpus CSV schema (corpus_capture.py) agree on."""
+        return {
+            "packet_count": float(self.packet_count()),
+            "byte_count": float(self.byte_count()),
+            "unique_ports": float(len(self.unique_dst_ports())),
+            "unique_dst_ips": float(len(self.unique_dst_ips())),
+            "syn_count": float(self.syn_count()),
+            "mean_packet_size": self.mean_packet_size(),
+        }
+
 
 @dataclass
 class Detection:
@@ -73,9 +106,19 @@ class Detection:
 
 class BaseDetector:
     name = "base"
+    # Eval-ops metadata: bump `version` whenever detection logic/thresholds
+    # change so MLflow runs and shipped incidents can be traced to a
+    # specific algorithm revision (see DETECTOR_REGISTRY / eval_harness.py).
+    version = "0.0.0"
+    description = ""
+
+    def evaluate_features(
+        self, src_ip: str, features: dict[str, float], now: float
+    ) -> Optional[Detection]:
+        raise NotImplementedError
 
     def evaluate(self, src_ip: str, window: FlowWindow, now: float) -> Optional[Detection]:
-        raise NotImplementedError
+        return self.evaluate_features(src_ip, window.to_features(), now)
 
 
 # --------------------------------------------------------------------------- #
@@ -85,12 +128,16 @@ class BaseDetector:
 # --------------------------------------------------------------------------- #
 class RandomDetector(BaseDetector):
     name = "basically-random"
+    version = "1.0.0"
+    description = "Fires with a small fixed probability; no real signal, demo/API-exercise only."
 
     def __init__(self, fire_probability: float = 0.02):
         self.fire_probability = fire_probability
 
-    def evaluate(self, src_ip: str, window: FlowWindow, now: float) -> Optional[Detection]:
-        if window.packet_count() == 0:
+    def evaluate_features(
+        self, src_ip: str, features: dict[str, float], now: float
+    ) -> Optional[Detection]:
+        if features["packet_count"] == 0:
             return None
         if random.random() >= self.fire_probability:
             return None
@@ -100,7 +147,7 @@ class RandomDetector(BaseDetector):
             severity=severity,
             symptom=f"Randomly flagged traffic from {src_ip} (demo/no-signal detector).",
             src_ip=src_ip,
-            details=[f"packets={window.packet_count()}", f"bytes={window.byte_count()}"],
+            details=[f"packets={features['packet_count']:.0f}", f"bytes={features['byte_count']:.0f}"],
             score=random.random(),
         )
 
@@ -111,6 +158,8 @@ class RandomDetector(BaseDetector):
 # --------------------------------------------------------------------------- #
 class RulesDetector(BaseDetector):
     name = "deterministic-rules"
+    version = "1.0.0"
+    description = "Fixed thresholds on SYN count / unique ports / byte volume."
 
     def __init__(
         self,
@@ -122,37 +171,39 @@ class RulesDetector(BaseDetector):
         self.port_scan_unique_ports = port_scan_unique_ports
         self.exfil_byte_threshold = exfil_byte_threshold
 
-    def evaluate(self, src_ip: str, window: FlowWindow, now: float) -> Optional[Detection]:
-        syns = window.syn_count()
+    def evaluate_features(
+        self, src_ip: str, features: dict[str, float], now: float
+    ) -> Optional[Detection]:
+        syns = features["syn_count"]
         if syns >= self.syn_flood_threshold:
             return Detection(
                 algorithm=self.name,
                 severity="high",
-                symptom=f"Possible SYN flood from {src_ip}: {syns} SYNs in window.",
+                symptom=f"Possible SYN flood from {src_ip}: {syns:.0f} SYNs in window.",
                 src_ip=src_ip,
-                details=[f"syn_count={syns}", "rule=syn_flood"],
+                details=[f"syn_count={syns:.0f}", "rule=syn_flood"],
                 score=min(1.0, syns / (self.syn_flood_threshold * 2)),
             )
 
-        ports = window.unique_dst_ports()
-        if len(ports) >= self.port_scan_unique_ports:
+        ports = features["unique_ports"]
+        if ports >= self.port_scan_unique_ports:
             return Detection(
                 algorithm=self.name,
                 severity="medium",
-                symptom=f"Possible port scan from {src_ip}: {len(ports)} distinct destination ports.",
+                symptom=f"Possible port scan from {src_ip}: {ports:.0f} distinct destination ports.",
                 src_ip=src_ip,
-                details=[f"unique_ports={len(ports)}", "rule=port_scan"],
-                score=min(1.0, len(ports) / (self.port_scan_unique_ports * 2)),
+                details=[f"unique_ports={ports:.0f}", "rule=port_scan"],
+                score=min(1.0, ports / (self.port_scan_unique_ports * 2)),
             )
 
-        total_bytes = window.byte_count()
+        total_bytes = features["byte_count"]
         if total_bytes >= self.exfil_byte_threshold:
             return Detection(
                 algorithm=self.name,
                 severity="critical",
-                symptom=f"Possible data exfiltration from {src_ip}: {total_bytes} bytes in window.",
+                symptom=f"Possible data exfiltration from {src_ip}: {total_bytes:.0f} bytes in window.",
                 src_ip=src_ip,
-                details=[f"bytes={total_bytes}", "rule=volume_exfil"],
+                details=[f"bytes={total_bytes:.0f}", "rule=volume_exfil"],
                 score=min(1.0, total_bytes / (self.exfil_byte_threshold * 2)),
             )
         return None
@@ -166,18 +217,12 @@ class RulesDetector(BaseDetector):
 # --------------------------------------------------------------------------- #
 class MLDetector(BaseDetector):
     name = "ml-model"
+    version = "0.1.0-stub"
+    description = "Stub z-score anomaly over running per-source byte-volume baseline."
 
     def __init__(self, z_score_threshold: float = 3.0):
         self.z_score_threshold = z_score_threshold
         self._baseline: dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
-
-    def extract_features(self, window: FlowWindow) -> dict[str, float]:
-        return {
-            "packet_count": float(window.packet_count()),
-            "byte_count": float(window.byte_count()),
-            "unique_ports": float(len(window.unique_dst_ports())),
-            "mean_packet_size": window.mean_packet_size(),
-        }
 
     def score(self, features: dict[str, float], history: deque) -> float:
         """TODO: replace with model.predict(feature_vector) from a trained
@@ -189,10 +234,11 @@ class MLDetector(BaseDetector):
         stdev = statistics.pstdev(history) or 1.0
         return abs(features["byte_count"] - mean) / stdev
 
-    def evaluate(self, src_ip: str, window: FlowWindow, now: float) -> Optional[Detection]:
-        if window.packet_count() == 0:
+    def evaluate_features(
+        self, src_ip: str, features: dict[str, float], now: float
+    ) -> Optional[Detection]:
+        if features["packet_count"] == 0:
             return None
-        features = self.extract_features(window)
         z = self.score(features, self._baseline[src_ip])
         if z < self.z_score_threshold:
             return None
@@ -213,18 +259,19 @@ class MLDetector(BaseDetector):
 # --------------------------------------------------------------------------- #
 class LLMDetector(BaseDetector):
     name = "llm"
+    version = "0.1.0-stub"
+    description = "Stub keyword heuristic simulating LLM reasoning over a flow summary."
 
     SUSPICIOUS_KEYWORDS = ("scan", "flood", "many", "unusual", "spike")
 
     def __init__(self, min_packets: int = 25):
         self.min_packets = min_packets
 
-    def _summarize(self, src_ip: str, window: FlowWindow) -> str:
-        ports = window.unique_dst_ports()
+    def _summarize(self, src_ip: str, features: dict[str, float]) -> str:
         return (
-            f"host {src_ip} sent {window.packet_count()} packets "
-            f"({window.byte_count()} bytes) to {len(window.unique_dst_ips())} destinations "
-            f"across {len(ports)} unique ports in the recent window"
+            f"host {src_ip} sent {features['packet_count']:.0f} packets "
+            f"({features['byte_count']:.0f} bytes) to {features['unique_dst_ips']:.0f} destinations "
+            f"across {features['unique_ports']:.0f} unique ports in the recent window"
         )
 
     def _stub_reasoning(self, summary: str) -> tuple[bool, str, str]:
@@ -244,10 +291,12 @@ class LLMDetector(BaseDetector):
             return True, "high", f"[STUB LLM] Reasoned this looks like reconnaissance: {summary}"
         return False, "info", summary
 
-    def evaluate(self, src_ip: str, window: FlowWindow, now: float) -> Optional[Detection]:
-        if window.packet_count() < self.min_packets:
+    def evaluate_features(
+        self, src_ip: str, features: dict[str, float], now: float
+    ) -> Optional[Detection]:
+        if features["packet_count"] < self.min_packets:
             return None
-        summary = self._summarize(src_ip, window)
+        summary = self._summarize(src_ip, features)
         flagged, severity, message = self._stub_reasoning(summary)
         if not flagged:
             return None
@@ -261,9 +310,21 @@ class LLMDetector(BaseDetector):
         )
 
 
-DETECTORS = {
+# --------------------------------------------------------------------------- #
+# Eval-ops registry: the single place new/more-performant algorithms are
+# wired in. `main.py --algorithm <name>` and `eval_harness.py --algorithm
+# <name>` both resolve against this dict, so shipping a new algorithm is:
+#   1. Implement a BaseDetector subclass (evaluate_features + version/description).
+#   2. Add it here.
+#   3. Backtest it with eval_harness.py against the labeled corpus before
+#      switching production traffic to it via --algorithm.
+# --------------------------------------------------------------------------- #
+DETECTOR_REGISTRY: dict[str, type[BaseDetector]] = {
     "random": RandomDetector,
     "rules": RulesDetector,
     "ml": MLDetector,
     "llm": LLMDetector,
 }
+
+# Backwards-compatible alias (main.py originally imported DETECTORS).
+DETECTORS = DETECTOR_REGISTRY

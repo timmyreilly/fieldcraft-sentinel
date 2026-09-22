@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 /tmp/
 *.bin
+mlflow.db
+mlruns/
+mlartifacts/
+corpus/*/pcap/
+dist/
