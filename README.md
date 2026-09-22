@@ -56,6 +56,58 @@ sudo .venv/bin/python main.py --bearer-token "$TOKEN" --tenant-id smoke-tenant \
 Other flags: `--service`, `--source-system`, `--min-severity`, `--api-base`,
 `-v/--verbose`.
 
+## Generating demo traffic (`traffic_gen.py`)
+
+`traffic_gen.py` generates traffic scenarios for Sentinel to detect. It is
+restricted to loopback targets (`127.0.0.1`) so it's safe to run without
+accidentally scanning/flooding a real network segment. Requires `nmap` and
+`hping` (`sudo pacman -S nmap hping` — already installed on this VM).
+
+Run it in a **second terminal**, alongside Sentinel watching `lo`:
+
+```bash
+# terminal 1: start Sentinel watching the loopback interface
+TOKEN=$(/home/omarchy/.azcli-venv/bin/az account get-access-token \
+  --scope api://fieldcraft-triage/Triage.Access --query accessToken -o tsv)
+sudo /home/omarchy/fieldcraft-sentinel/.venv/bin/python \
+  /home/omarchy/fieldcraft-sentinel/main.py \
+  --bearer-token "$TOKEN" --tenant-id smoke-tenant \
+  --algorithm rules --interface lo -v
+
+# terminal 2: fire a scenario (give Sentinel ~5s to finish starting tshark first)
+python3 /home/omarchy/fieldcraft-sentinel/traffic_gen.py --scenario port-scan
+```
+
+Available scenarios (`--scenario`):
+
+| Scenario    | What it does                                              | Trips                                      |
+|-------------|------------------------------------------------------------|---------------------------------------------|
+| `baseline`  | Steady low-rate requests to a throwaway local HTTP server  | Builds a normal-traffic baseline for `ml`   |
+| `port-scan` | `nmap` TCP connect scan across ports 1-200                 | `rules` port-scan rule, `llm` recon heuristic |
+| `syn-flood` | `hping` SYN flood at a single port                         | `rules` SYN-flood rule                      |
+| `exfil`     | Large repeated payload upload (default 8MB)                | `rules` volume rule, `ml` anomaly z-score   |
+| `all`       | Runs `baseline`, then `port-scan`, `syn-flood`, `exfil` in sequence | all of the above |
+
+Useful flags: `--target` (default `127.0.0.1`, refuses non-loopback targets),
+`--port` (default `8765`), `--syn-count`, `--exfil-mb`,
+`--baseline-requests`, `--baseline-delay`.
+
+Examples:
+
+```bash
+python3 traffic_gen.py --scenario syn-flood --syn-count 200
+python3 traffic_gen.py --scenario exfil --exfil-mb 20
+python3 traffic_gen.py --scenario all
+```
+
+You should see Sentinel log lines like:
+```
+INFO fieldcraft_sentinel: Reported incident incident-<id> (severity=high, algo=deterministic-rules, src=127.0.0.1)
+```
+and the incident will appear in the Triage console
+(`https://fieldcraft-triage-bqfkc5d6aufme9dc.b02.azurefd.net/console`,
+tenant `smoke-tenant`).
+
 ## Notes / known constraints
 
 - `pyshark` predates Python 3.14's asyncio changes; `main.py` includes a small
